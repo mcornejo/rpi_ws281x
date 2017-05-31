@@ -36,18 +36,14 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <signal.h>
-#include <linux/types.h>
-#include <linux/spi/spidev.h>
 
 #include "mailbox.h"
 #include "clk.h"
 #include "gpio.h"
 #include "dma.h"
 #include "pwm.h"
-#include "pcm.h"
 #include "rpihw.h"
 
 #include "ws2811.h"
@@ -66,21 +62,10 @@
 // Pad out to the nearest uint32 + 32-bits for idle low/high times the number of channels
 #define PWM_BYTE_COUNT(leds, freq)               (((((LED_BIT_COUNT(leds, freq) >> 3) & ~0x7) + 4) + 4) * \
                                                   RPI_PWM_CHANNELS)
-#define PCM_BYTE_COUNT(leds, freq)               ((((LED_BIT_COUNT(leds, freq) >> 3) & ~0x7) + 4) + 4)
 
-// Symbol definitions
 #define SYMBOL_HIGH                              0x6  // 1 1 0
 #define SYMBOL_LOW                               0x4  // 1 0 0
 
-// Symbol definitions for software inversion (PCM and SPI only)
-#define SYMBOL_HIGH_INV                          0x1  // 0 0 1
-#define SYMBOL_LOW_INV                           0x3  // 0 1 1
-
-// Driver mode definitions
-#define NONE	0
-#define PWM	1
-#define PCM	2
-#define SPI	3
 
 // We use the mailbox interface to request memory from the VideoCore.
 // This lets us request one physically contiguous chunk, find its
@@ -97,16 +82,13 @@ typedef struct videocore_mbox {
 
 typedef struct ws2811_device
 {
-    int driver_mode;
-    volatile uint8_t *pxl_raw;
+    volatile uint8_t *pwm_raw;
     volatile dma_t *dma;
     volatile pwm_t *pwm;
-    volatile pcm_t *pcm;
-    int spi_fd;
     volatile dma_cb_t *dma_cb;
     uint32_t dma_cb_addr;
     volatile gpio_t *gpio;
-    volatile cm_clk_t *cm_clk;
+    volatile cm_pwm_t *cm_pwm;
     videocore_mbox_t mbox;
     int max_count;
 } ws2811_device_t;
@@ -135,7 +117,6 @@ static int max_channel_led_count(ws2811_t *ws2811)
 
 /**
  * Map all devices into userspace memory.
- * Not called for SPI
  *
  * @param    ws2811  ws2811 instance pointer.
  *
@@ -147,7 +128,6 @@ static int map_registers(ws2811_t *ws2811)
     const rpi_hw_t *rpi_hw = ws2811->rpi_hw;
     uint32_t base = ws2811->rpi_hw->periph_base;
     uint32_t dma_addr;
-    uint32_t offset = 0;
 
     dma_addr = dmanum_to_offset(ws2811->dmanum);
     if (!dma_addr)
@@ -162,22 +142,10 @@ static int map_registers(ws2811_t *ws2811)
         return -1;
     }
 
-    switch (device->driver_mode) {
-    case PWM:
-        device->pwm = mapmem(PWM_OFFSET + base, sizeof(pwm_t));
-        if (!device->pwm)
-        {
-            return -1;
-        }
-        break;
-
-    case PCM:
-        device->pcm = mapmem(PCM_OFFSET + base, sizeof(pcm_t));
-        if (!device->pcm)
-        {
-            return -1;
-        }
-        break;
+    device->pwm = mapmem(PWM_OFFSET + base, sizeof(pwm_t));
+    if (!device->pwm)
+    {
+        return -1;
     }
 
     device->gpio = mapmem(GPIO_OFFSET + base, sizeof(gpio_t));
@@ -186,16 +154,8 @@ static int map_registers(ws2811_t *ws2811)
         return -1;
     }
 
-    switch (device->driver_mode) {
-    case PWM:
-        offset = CM_PWM_OFFSET;
-        break;
-    case PCM:
-        offset = CM_PCM_OFFSET;
-        break;
-    }
-    device->cm_clk = mapmem(offset + base, sizeof(cm_clk_t));
-    if (!device->cm_clk)
+    device->cm_pwm = mapmem(CM_PWM_OFFSET + base, sizeof(cm_pwm_t));
+    if (!device->cm_pwm)
     {
         return -1;
     }
@@ -224,14 +184,9 @@ static void unmap_registers(ws2811_t *ws2811)
         unmapmem((void *)device->pwm, sizeof(pwm_t));
     }
 
-    if (device->pcm)
+    if (device->cm_pwm)
     {
-        unmapmem((void *)device->pcm, sizeof(pcm_t));
-    }
-
-    if (device->cm_clk)
-    {
-        unmapmem((void *)device->cm_clk, sizeof(cm_clk_t));
+        unmapmem((void *)device->cm_pwm, sizeof(cm_pwm_t));
     }
 
     if (device->gpio)
@@ -268,40 +223,16 @@ static void stop_pwm(ws2811_t *ws2811)
 {
     ws2811_device_t *device = ws2811->device;
     volatile pwm_t *pwm = device->pwm;
-    volatile cm_clk_t *cm_clk = device->cm_clk;
+    volatile cm_pwm_t *cm_pwm = device->cm_pwm;
 
     // Turn off the PWM in case already running
     pwm->ctl = 0;
     usleep(10);
 
     // Kill the clock if it was already running
-    cm_clk->ctl = CM_CLK_CTL_PASSWD | CM_CLK_CTL_KILL;
+    cm_pwm->ctl = CM_PWM_CTL_PASSWD | CM_PWM_CTL_KILL;
     usleep(10);
-    while (cm_clk->ctl & CM_CLK_CTL_BUSY)
-        ;
-}
-
-/**
- * Stop the PCM controller.
- *
- * @param    ws2811  ws2811 instance pointer.
- *
- * @returns  None
- */
-static void stop_pcm(ws2811_t *ws2811)
-{
-    ws2811_device_t *device = ws2811->device;
-    volatile pcm_t *pcm = device->pcm;
-    volatile cm_clk_t *cm_clk = device->cm_clk;
-
-    // Turn off the PCM in case already running
-    pcm->cs = 0;
-    usleep(10);
-
-    // Kill the clock if it was already running
-    cm_clk->ctl = CM_CLK_CTL_PASSWD | CM_CLK_CTL_KILL;
-    usleep(10);
-    while (cm_clk->ctl & CM_CLK_CTL_BUSY)
+    while (cm_pwm->ctl & CM_PWM_CTL_BUSY)
         ;
 }
 
@@ -318,19 +249,19 @@ static int setup_pwm(ws2811_t *ws2811)
     volatile dma_t *dma = device->dma;
     volatile dma_cb_t *dma_cb = device->dma_cb;
     volatile pwm_t *pwm = device->pwm;
-    volatile cm_clk_t *cm_clk = device->cm_clk;
-    int maxcount = device->max_count;
+    volatile cm_pwm_t *cm_pwm = device->cm_pwm;
+    int maxcount = max_channel_led_count(ws2811);
     uint32_t freq = ws2811->freq;
     int32_t byte_count;
 
     stop_pwm(ws2811);
 
-    // Setup the Clock - Use OSC @ 19.2Mhz w/ 3 clocks/tick
-    cm_clk->div = CM_CLK_DIV_PASSWD | CM_CLK_DIV_DIVI(OSC_FREQ / (3 * freq));
-    cm_clk->ctl = CM_CLK_CTL_PASSWD | CM_CLK_CTL_SRC_OSC;
-    cm_clk->ctl = CM_CLK_CTL_PASSWD | CM_CLK_CTL_SRC_OSC | CM_CLK_CTL_ENAB;
+    // Setup the PWM Clock - Use OSC @ 19.2Mhz w/ 3 clocks/tick
+    cm_pwm->div = CM_PWM_DIV_PASSWD | CM_PWM_DIV_DIVI(OSC_FREQ / (3 * freq));
+    cm_pwm->ctl = CM_PWM_CTL_PASSWD | CM_PWM_CTL_SRC_OSC;
+    cm_pwm->ctl = CM_PWM_CTL_PASSWD | CM_PWM_CTL_SRC_OSC | CM_PWM_CTL_ENAB;
     usleep(10);
-    while (!(cm_clk->ctl & CM_CLK_CTL_BUSY))
+    while (!(cm_pwm->ctl & CM_PWM_CTL_BUSY))
         ;
 
     // Setup the PWM, use delays as the block is rumored to lock up without them.  Make
@@ -366,74 +297,9 @@ static int setup_pwm(ws2811_t *ws2811)
                  RPI_DMA_TI_PERMAP(5) |       // PWM peripheral
                  RPI_DMA_TI_SRC_INC;          // Increment src addr
 
-    dma_cb->source_ad = addr_to_bus(device, device->pxl_raw);
+    dma_cb->source_ad = addr_to_bus(device, device->pwm_raw);
 
     dma_cb->dest_ad = (uint32_t)&((pwm_t *)PWM_PERIPH_PHYS)->fif1;
-    dma_cb->txfr_len = byte_count;
-    dma_cb->stride = 0;
-    dma_cb->nextconbk = 0;
-
-    dma->cs = 0;
-    dma->txfr_len = 0;
-
-    return 0;
-}
-
-/**
- * Setup the PCM controller with one 32-bit channel in a 32-bit frame using DMA to feed the PCM FIFO.
- *
- * @param    ws2811  ws2811 instance pointer.
- *
- * @returns  None
- */
-static int setup_pcm(ws2811_t *ws2811)
-{
-    ws2811_device_t *device = ws2811->device;
-    volatile dma_t *dma = device->dma;
-    volatile dma_cb_t *dma_cb = device->dma_cb;
-    volatile pcm_t *pcm = device->pcm;
-    volatile cm_clk_t *cm_clk = device->cm_clk;
-    //int maxcount = max_channel_led_count(ws2811);
-    int maxcount = device->max_count;
-    uint32_t freq = ws2811->freq;
-    int32_t byte_count;
-
-    stop_pcm(ws2811);
-
-    // Setup the PCM Clock - Use OSC @ 19.2Mhz w/ 3 clocks/tick
-    cm_clk->div = CM_CLK_DIV_PASSWD | CM_CLK_DIV_DIVI(OSC_FREQ / (3 * freq));
-    cm_clk->ctl = CM_CLK_CTL_PASSWD | CM_CLK_CTL_SRC_OSC;
-    cm_clk->ctl = CM_CLK_CTL_PASSWD | CM_CLK_CTL_SRC_OSC | CM_CLK_CTL_ENAB;
-    usleep(10);
-    while (!(cm_clk->ctl & CM_CLK_CTL_BUSY))
-        ;
-
-    // Setup the PCM, use delays as the block is rumored to lock up without them.  Make
-    // sure to use a high enough priority to avoid any FIFO underruns, especially if
-    // the CPU is busy doing lots of memory accesses, or another DMA controller is
-    // busy.  The FIFO will clock out data at a much slower rate (2.6Mhz max), so
-    // the odds of a DMA priority boost are extremely low.
-
-    pcm->cs = RPI_PCM_CS_EN;            // Enable PCM hardware
-    pcm->mode = (RPI_PCM_MODE_FLEN(31) | RPI_PCM_MODE_FSLEN(1));
-                // Framelength 32, clock enabled, frame sync pulse
-    pcm->txc = RPI_PCM_TXC_CH1WEX | RPI_PCM_TXC_CH1EN | RPI_PCM_TXC_CH1POS(0) | RPI_PCM_TXC_CH1WID(8);
-               // Single 32-bit channel
-    pcm->cs |= RPI_PCM_CS_TXCLR;        // Reset transmit fifo
-    usleep(10);
-    pcm->cs |= RPI_PCM_CS_DMAEN;         // Enable DMA DREQ
-    pcm->dreq = (RPI_PCM_DREQ_TX(0x3F) | RPI_PCM_DREQ_TX_PANIC(0x10)); // Set FIFO tresholds
-
-    // Initialize the DMA control block
-    byte_count = PCM_BYTE_COUNT(maxcount, freq);
-    dma_cb->ti = RPI_DMA_TI_NO_WIDE_BURSTS |  // 32-bit transfers
-                 RPI_DMA_TI_WAIT_RESP |       // wait for write complete
-                 RPI_DMA_TI_DEST_DREQ |       // user peripheral flow control
-                 RPI_DMA_TI_PERMAP(2) |       // PCM TX peripheral
-                 RPI_DMA_TI_SRC_INC;          // Increment src addr
-
-    dma_cb->source_ad = addr_to_bus(device, device->pxl_raw);
-    dma_cb->dest_ad = (uint32_t)&((pcm_t *)PCM_PERIPH_PHYS)->fifo;
     dma_cb->txfr_len = byte_count;
     dma_cb->stride = 0;
     dma_cb->nextconbk = 0;
@@ -456,7 +322,6 @@ static void dma_start(ws2811_t *ws2811)
 {
     ws2811_device_t *device = ws2811->device;
     volatile dma_t *dma = device->dma;
-    volatile pcm_t *pcm = device->pcm;
     uint32_t dma_cb_addr = device->dma_cb_addr;
 
     dma->cs = RPI_DMA_CS_RESET;
@@ -471,15 +336,10 @@ static void dma_start(ws2811_t *ws2811)
               RPI_DMA_CS_PANIC_PRIORITY(15) |
               RPI_DMA_CS_PRIORITY(15) |
               RPI_DMA_CS_ACTIVE;
-
-    if (device->driver_mode == PCM)
-    {
-        pcm->cs |= RPI_PCM_CS_TXON;  // Start transmission
-    }
 }
 
 /**
- * Initialize the application selected GPIO pins for PWM/PCM operation.
+ * Initialize the application selected GPIO pins for PWM operation.
  *
  * @param    ws2811  ws2811 instance pointer.
  *
@@ -489,7 +349,6 @@ static int gpio_init(ws2811_t *ws2811)
 {
     volatile gpio_t *gpio = ws2811->device->gpio;
     int chan;
-    int altnum;
 
     for (chan = 0; chan < RPI_PWM_CHANNELS; chan++)
     {
@@ -497,17 +356,7 @@ static int gpio_init(ws2811_t *ws2811)
 
         if (pinnum)
         {
-            switch (ws2811->device->driver_mode)
-            {
-            case PWM:
-                altnum = pwm_pin_alt(chan, pinnum);
-                break;
-            case PCM:
-                altnum = pcm_pin_alt(PCMFUN_DOUT, pinnum);
-                break;
-            default:
-                altnum = -1;
-            }
+            int altnum = pwm_pin_alt(chan, pinnum);
 
             if (altnum < 0)
             {
@@ -532,8 +381,8 @@ static int gpio_init(ws2811_t *ws2811)
  */
 void pwm_raw_init(ws2811_t *ws2811)
 {
-    volatile uint32_t *pxl_raw = (uint32_t *)ws2811->device->pxl_raw;
-    int maxcount = ws2811->device->max_count;
+    volatile uint32_t *pwm_raw = (uint32_t *)ws2811->device->pwm_raw;
+    int maxcount = max_channel_led_count(ws2811);
     int wordcount = (PWM_BYTE_COUNT(maxcount, ws2811->freq) / sizeof(uint32_t)) /
                     RPI_PWM_CHANNELS;
     int chan;
@@ -544,30 +393,9 @@ void pwm_raw_init(ws2811_t *ws2811)
 
         for (i = 0; i < wordcount; i++)
         {
-            pxl_raw[wordpos] = 0x0;
+            pwm_raw[wordpos] = 0x0;
             wordpos += 2;
         }
-    }
-}
-
-/**
- * Initialize the PCM DMA buffer with all zeros.
- * The DMA buffer length is assumed to be a word multiple.
- *
- * @param    ws2811  ws2811 instance pointer.
- *
- * @returns  None
- */
-void pcm_raw_init(ws2811_t *ws2811)
-{
-    volatile uint32_t *pxl_raw = (uint32_t *)ws2811->device->pxl_raw;
-    int maxcount = ws2811->device->max_count;
-    int wordcount = PCM_BYTE_COUNT(maxcount, ws2811->freq) / sizeof(uint32_t);
-    int i;
-
-    for (i = 0; i < wordcount; i++)
-    {
-        pxl_raw[i] = 0x0;
     }
 }
 
@@ -585,7 +413,7 @@ void ws2811_cleanup(ws2811_t *ws2811)
 
     for (chan = 0; chan < RPI_PWM_CHANNELS; chan++)
     {
-        if (ws2811->channel && ws2811->channel[chan].leds)
+        if (ws2811->channel[chan].leds)
         {
             free(ws2811->channel[chan].leds);
         }
@@ -604,212 +432,11 @@ void ws2811_cleanup(ws2811_t *ws2811)
         mbox->handle = -1;
     }
 
-    if (device && (device->spi_fd > 0))
-    {
-        close(device->spi_fd);
-    }
-
     if (device) {
         free(device);
     }
     ws2811->device = NULL;
 }
-
-static int set_driver_mode(ws2811_t *ws2811, int gpionum)
-{
-    int gpionum2;
-
-    if (gpionum == 18 || gpionum == 12) {
-        ws2811->device->driver_mode = PWM;
-        // Check gpio for PWM1 (2nd channel) is OK if used
-        gpionum2 = ws2811->channel[1].gpionum;
-        if (gpionum2 == 0 || gpionum2 == 13 || gpionum2 == 19) {
-            return 0;
-        } 
-    }
-    else if (gpionum == 21 || gpionum == 31) {
-        ws2811->device->driver_mode = PCM;
-    }
-    else if (gpionum == 10) {
-        ws2811->device->driver_mode = SPI;
-    }
-    else {
-        fprintf(stderr, "gpionum %d not allowed\n", gpionum);
-        return -1;
-    }
-    // For PCM and SPI zero the 2nd channel
-    memset(&ws2811->channel[1], 0, sizeof(ws2811_channel_t));
-
-    return 0;
-}
-
-static int check_hwver_and_gpionum(ws2811_t *ws2811)
-{
-    const rpi_hw_t *rpi_hw;
-    int hwver, gpionum;
-    int gpionums_B1[] = { 10, 18, 21 };
-    int gpionums_B2[] = { 10, 18, 31 };
-    int gpionums_40p[] = { 10, 12, 18, 21};
-    int i;
-
-    rpi_hw = ws2811->rpi_hw;
-    hwver = rpi_hw->hwver & 0x0000ffff;
-    gpionum = ws2811->channel[0].gpionum;
-    if (hwver < 0x0004)  // Model B Rev 1
-    {
-        for ( i = 0; i < (sizeof(gpionums_B1) / sizeof(gpionums_B1[0])); i++)
-        {
-            if (gpionums_B1[i] == gpionum) {
-                // Set driver mode (PWM, PCM, or SPI)
-                return set_driver_mode(ws2811, gpionum);
-            }
-        }
-    }
-    else if (hwver >= 0x000e && hwver <= 0x000f)  // Models B Rev2, A
-    {
-        for ( i = 0; i < (sizeof(gpionums_B2) / sizeof(gpionums_B2[0])); i++)
-        {
-            if (gpionums_B2[i] == gpionum) {
-                // Set driver mode (PWM, PCM, or SPI)
-                return set_driver_mode(ws2811, gpionum);
-            }
-        }
-    }
-    else if (hwver >= 0x010) // Models B+, A+, 2B, 3B
-    {
-        if ((ws2811->channel[0].count == 0) && (ws2811->channel[1].count > 0))
-        {
-            // Special case: nothing in channel 0, channel 1 only PWM1 allowed
-            // PWM1 only available on 40 pin GPIO interface
-            gpionum = ws2811->channel[1].gpionum;
-            if ((gpionum == 13) || (gpionum == 19))
-            {
-                ws2811->device->driver_mode = PWM;
-                return 0;
-            }
-            else {
-                return -1;
-            }
-        }
-        for ( i = 0; i < (sizeof(gpionums_40p) / sizeof(gpionums_40p[0])); i++)
-        {
-            if (gpionums_40p[i] == gpionum) {
-                // Set driver mode (PWM, PCM, or SPI)
-                return set_driver_mode(ws2811, gpionum);
-            }
-        }
-    }
-    fprintf(stderr, "Gpio %d is illegal for LED channel 0\n", gpionum);
-    return -1;
-}
-
-static ws2811_return_t spi_init(ws2811_t *ws2811)
-{
-    int spi_fd;
-    static uint8_t mode;
-    static uint8_t bits = 8;
-    uint32_t speed = ws2811->freq * 3;
-    ws2811_device_t *device = ws2811->device;
-
-    spi_fd = open("/dev/spidev0.0", O_RDWR);
-    if (spi_fd < 0) {
-        fprintf(stderr, "Cannot open /dev/spidev0.0. spi_bcm2835 module not loaded?\n");
-        return WS2811_ERROR_SPI_SETUP;
-    }
-    device->spi_fd = spi_fd;
-
-    // SPI mode
-    if (ioctl(spi_fd, SPI_IOC_WR_MODE, &mode) < 0)
-    {
-        return WS2811_ERROR_SPI_SETUP;
-    }
-    if (ioctl(spi_fd, SPI_IOC_RD_MODE, &mode) < 0)
-    {
-        return WS2811_ERROR_SPI_SETUP;
-    }
-
-    // Bits per word
-    if (ioctl(spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0)
-    {
-        return WS2811_ERROR_SPI_SETUP;
-    }
-    if (ioctl(spi_fd, SPI_IOC_RD_BITS_PER_WORD, &bits) < 0)
-    {
-        return WS2811_ERROR_SPI_SETUP;
-    }
-
-    // Max speed Hz
-    if (ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0)
-    {
-        return WS2811_ERROR_SPI_SETUP;
-    }
-    if (ioctl(spi_fd, SPI_IOC_RD_MAX_SPEED_HZ, &speed) < 0)
-    {
-        return WS2811_ERROR_SPI_SETUP;
-    }
-
-    // Initialize device structure elements to not used
-    // except driver_mode, spi_fd and max_count (already defined when spi_init called)
-    device->pxl_raw = NULL;
-    device->dma = NULL;
-    device->pwm = NULL;
-    device->pcm = NULL;
-    device->dma_cb = NULL;
-    device->dma_cb_addr = 0;
-    device->gpio = NULL;
-    device->cm_clk = NULL;
-    device->mbox.handle = -1;
-
-    // Allocate LED buffer
-    ws2811_channel_t *channel = &ws2811->channel[0];
-    channel->leds = malloc(sizeof(ws2811_led_t) * channel->count);
-    if (!channel->leds)
-    {
-        ws2811_cleanup(ws2811);
-	return WS2811_ERROR_OUT_OF_MEMORY;
-    }
-    memset(channel->leds, 0, sizeof(ws2811_led_t) * channel->count);
-    if (!channel->strip_type)
-    {
-      channel->strip_type=WS2811_STRIP_RGB;
-    }
-
-    channel->wshift = (channel->strip_type >> 24) & 0xff;
-    channel->rshift = (channel->strip_type >> 16) & 0xff;
-    channel->gshift = (channel->strip_type >> 8)  & 0xff;
-    channel->bshift = (channel->strip_type >> 0)  & 0xff;
-
-    // Allocate SPI transmit buffer (same size as PCM)
-    device->pxl_raw = malloc(PCM_BYTE_COUNT(device->max_count, ws2811->freq));
-    if (device->pxl_raw == NULL)
-    {
-        ws2811_cleanup(ws2811);
-        return WS2811_ERROR_OUT_OF_MEMORY;
-    }
-    pcm_raw_init(ws2811);
-
-    return WS2811_SUCCESS;
-}
-
-static ws2811_return_t spi_transfer(ws2811_t *ws2811)
-{
-    int ret;
-    struct spi_ioc_transfer tr;
-
-    memset(&tr, 0, sizeof(struct spi_ioc_transfer));
-    tr.tx_buf = (unsigned long)ws2811->device->pxl_raw;
-    tr.rx_buf = 0;
-    tr.len = PCM_BYTE_COUNT(ws2811->device->max_count, ws2811->freq);
-
-    ret = ioctl(ws2811->device->spi_fd, SPI_IOC_MESSAGE(1), &tr);
-    if (ret < 1)
-    {
-        fprintf(stderr, "Can't send spi message");
-	return WS2811_ERROR_SPI_TRANSFER;
-    }
-
-    return WS2811_SUCCESS;
-}    
 
 
 /*
@@ -826,7 +453,7 @@ static ws2811_return_t spi_transfer(ws2811_t *ws2811)
  *
  * @returns  0 on success, -1 otherwise.
  */
-ws2811_return_t ws2811_init(ws2811_t *ws2811)
+int ws2811_init(ws2811_t *ws2811)
 {
     ws2811_device_t *device;
     const rpi_hw_t *rpi_hw;
@@ -835,61 +462,41 @@ ws2811_return_t ws2811_init(ws2811_t *ws2811)
     ws2811->rpi_hw = rpi_hw_detect();
     if (!ws2811->rpi_hw)
     {
-        return WS2811_ERROR_HW_NOT_SUPPORTED;
+        return -1;
     }
     rpi_hw = ws2811->rpi_hw;
 
     ws2811->device = malloc(sizeof(*ws2811->device));
     if (!ws2811->device)
     {
-        return WS2811_ERROR_OUT_OF_MEMORY;
+        return -1;
     }
     device = ws2811->device;
 
-    if (check_hwver_and_gpionum(ws2811) < 0)
-    {
-        return WS2811_ERROR_ILLEGAL_GPIO;
-    }
-
-    device->max_count = max_channel_led_count(ws2811);
-
-    if (device->driver_mode == SPI) {
-        return spi_init(ws2811);
-    }
-
     // Determine how much physical memory we need for DMA
-    switch (device->driver_mode) {
-    case PWM:
-        device->mbox.size = PWM_BYTE_COUNT(device->max_count, ws2811->freq) +
-                            sizeof(dma_cb_t);
-        break;
-
-    case PCM:
-        device->mbox.size = PCM_BYTE_COUNT(device->max_count, ws2811->freq) +
-                            sizeof(dma_cb_t);
-        break;
-    }
+    device->mbox.size = PWM_BYTE_COUNT(max_channel_led_count(ws2811), ws2811->freq) +
+                        sizeof(dma_cb_t);
     // Round up to page size multiple
     device->mbox.size = (device->mbox.size + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1);
 
     device->mbox.handle = mbox_open();
     if (device->mbox.handle == -1)
     {
-        return WS2811_ERROR_MAILBOX_DEVICE;
+        return -1;
     }
 
     device->mbox.mem_ref = mem_alloc(device->mbox.handle, device->mbox.size, PAGE_SIZE,
                                      rpi_hw->videocore_base == 0x40000000 ? 0xC : 0x4);
     if (device->mbox.mem_ref == 0)
     {
-        return WS2811_ERROR_OUT_OF_MEMORY;
+       return -1;
     }
 
     device->mbox.bus_addr = mem_lock(device->mbox.handle, device->mbox.mem_ref);
     if (device->mbox.bus_addr == (uint32_t) ~0UL)
     {
        mem_free(device->mbox.handle, device->mbox.size);
-       return WS2811_ERROR_MEM_LOCK;
+       return -1;
     }
 
     device->mbox.virt_addr = mapmem(BUS_TO_PHYS(device->mbox.bus_addr), device->mbox.size);
@@ -897,13 +504,11 @@ ws2811_return_t ws2811_init(ws2811_t *ws2811)
     {
         mem_unlock(device->mbox.handle, device->mbox.mem_ref);
         mem_free(device->mbox.handle, device->mbox.size);
-
-        ws2811_cleanup(ws2811);
-        return WS2811_ERROR_MMAP;
+        goto err;
     }
 
     // Initialize all pointers to NULL.  Any non-NULL pointers will be freed on cleanup.
-    device->pxl_raw = NULL;
+    device->pwm_raw = NULL;
     device->dma_cb = NULL;
     for (chan = 0; chan < RPI_PWM_CHANNELS; chan++)
     {
@@ -918,8 +523,7 @@ ws2811_return_t ws2811_init(ws2811_t *ws2811)
         channel->leds = malloc(sizeof(ws2811_led_t) * channel->count);
         if (!channel->leds)
         {
-            ws2811_cleanup(ws2811);
-	    return WS2811_ERROR_OUT_OF_MEMORY;
+            goto err;
         }
 
         memset(channel->leds, 0, sizeof(ws2811_led_t) * channel->count);
@@ -928,26 +532,12 @@ ws2811_return_t ws2811_init(ws2811_t *ws2811)
         {
           channel->strip_type=WS2811_STRIP_RGB;
         }
-
-        channel->wshift = (channel->strip_type >> 24) & 0xff;
-        channel->rshift = (channel->strip_type >> 16) & 0xff;
-        channel->gshift = (channel->strip_type >> 8)  & 0xff;
-        channel->bshift = (channel->strip_type >> 0)  & 0xff;
-
     }
 
     device->dma_cb = (dma_cb_t *)device->mbox.virt_addr;
-    device->pxl_raw = (uint8_t *)device->mbox.virt_addr + sizeof(dma_cb_t);
+    device->pwm_raw = (uint8_t *)device->mbox.virt_addr + sizeof(dma_cb_t);
 
-    switch (device->driver_mode) {
-    case PWM:
-       pwm_raw_init(ws2811);
-       break;
-
-    case PCM:
-       pcm_raw_init(ws2811);
-       break;
-    }
+    pwm_raw_init(ws2811);
 
     memset((dma_cb_t *)device->dma_cb, 0, sizeof(dma_cb_t));
 
@@ -957,40 +547,29 @@ ws2811_return_t ws2811_init(ws2811_t *ws2811)
     // Map the physical registers into userspace
     if (map_registers(ws2811))
     {
-        ws2811_cleanup(ws2811);
-        return WS2811_ERROR_MAP_REGISTERS;
+        goto err;
     }
 
     // Initialize the GPIO pins
     if (gpio_init(ws2811))
     {
         unmap_registers(ws2811);
-        ws2811_cleanup(ws2811);
-        return WS2811_ERROR_GPIO_INIT;
+        goto err;
     }
 
-    switch (device->driver_mode) {
-    case PWM:
-        // Setup the PWM, clocks, and DMA
-        if (setup_pwm(ws2811))
-        {
-            unmap_registers(ws2811);
-            ws2811_cleanup(ws2811);
-            return WS2811_ERROR_PWM_SETUP;
-        }
-        break;
-    case PCM:
-    // Setup the PCM, clock, and DMA
-        if (setup_pcm(ws2811))
-        {
-            unmap_registers(ws2811);
-            ws2811_cleanup(ws2811);
-            return WS2811_ERROR_PCM_SETUP;
-        }
-        break;
+    // Setup the PWM, clocks, and DMA
+    if (setup_pwm(ws2811))
+    {
+        unmap_registers(ws2811);
+        goto err;
     }
 
-    return WS2811_SUCCESS;
+    return 0;
+
+err:
+    ws2811_cleanup(ws2811);
+
+    return -1;
 }
 
 /**
@@ -1002,18 +581,8 @@ ws2811_return_t ws2811_init(ws2811_t *ws2811)
  */
 void ws2811_fini(ws2811_t *ws2811)
 {
-    volatile pcm_t *pcm = ws2811->device->pcm;
-
     ws2811_wait(ws2811);
-    switch (ws2811->device->driver_mode) {
-    case PWM:
-        stop_pwm(ws2811);
-        break;
-    case PCM:
-        while (!(pcm->cs & RPI_PCM_CS_TXE)) ;    // Wait till TX FIFO is empty
-        stop_pcm(ws2811);
-        break;
-    }
+    stop_pwm(ws2811);
 
     unmap_registers(ws2811);
 
@@ -1027,14 +596,9 @@ void ws2811_fini(ws2811_t *ws2811)
  *
  * @returns  0 on success, -1 on DMA competion error
  */
-ws2811_return_t ws2811_wait(ws2811_t *ws2811)
+int ws2811_wait(ws2811_t *ws2811)
 {
     volatile dma_t *dma = ws2811->device->dma;
-
-    if (ws2811->device->driver_mode == SPI)  // Nothing to do for SPI
-    {
-        return WS2811_SUCCESS;
-    }
 
     while ((dma->cs & RPI_DMA_CS_ACTIVE) &&
            !(dma->cs & RPI_DMA_CS_ERROR))
@@ -1045,46 +609,45 @@ ws2811_return_t ws2811_wait(ws2811_t *ws2811)
     if (dma->cs & RPI_DMA_CS_ERROR)
     {
         fprintf(stderr, "DMA Error: %08x\n", dma->debug);
-        return WS2811_ERROR_DMA;
+        return -1;
     }
 
-    return WS2811_SUCCESS;
+    return 0;
 }
 
 /**
- * Render the DMA buffer from the user supplied LED arrays and start the DMA
+ * Render the PWM DMA buffer from the user supplied LED arrays and start the DMA
  * controller.  This will update all LEDs on both PWM channels.
  *
  * @param    ws2811  ws2811 instance pointer.
  *
  * @returns  None
  */
-ws2811_return_t  ws2811_render(ws2811_t *ws2811)
+int ws2811_render(ws2811_t *ws2811)
 {
-    volatile uint8_t *pxl_raw = ws2811->device->pxl_raw;
-    int driver_mode = ws2811->device->driver_mode;
-    int bitpos;
+    volatile uint8_t *pwm_raw = ws2811->device->pwm_raw;
+    int bitpos = 31;
     int i, k, l, chan;
     unsigned j;
-    ws2811_return_t ret = WS2811_SUCCESS;
-
-    bitpos = (driver_mode == SPI ? 7 : 31);
 
     for (chan = 0; chan < RPI_PWM_CHANNELS; chan++)         // Channel
     {
         ws2811_channel_t *channel = &ws2811->channel[chan];
-        int wordpos = chan; // PWM & PCM
-        int bytepos = 0;    // SPI
-        const int scale   = (channel->brightness & 0xff) + 1;
+        int wordpos = chan;
+        int scale   = (channel->brightness & 0xff) + 1;
+        int wshift  = (channel->strip_type >> 24) & 0xff;
+        int rshift  = (channel->strip_type >> 16) & 0xff;
+        int gshift  = (channel->strip_type >> 8)  & 0xff;
+        int bshift  = (channel->strip_type >> 0)  & 0xff;
 
         for (i = 0; i < channel->count; i++)                // Led
         {
             uint8_t color[] =
             {
-                (((channel->leds[i] >> channel->rshift) & 0xff) * scale) >> 8, // red
-                (((channel->leds[i] >> channel->gshift) & 0xff) * scale) >> 8, // green
-                (((channel->leds[i] >> channel->bshift) & 0xff) * scale) >> 8, // blue
-                (((channel->leds[i] >> channel->wshift) & 0xff) * scale) >> 8, // white
+                (((channel->leds[i] >> rshift) & 0xff) * scale) >> 8, // red
+                (((channel->leds[i] >> gshift) & 0xff) * scale) >> 8, // green
+                (((channel->leds[i] >> bshift) & 0xff) * scale) >> 8, // blue
+                (((channel->leds[i] >> wshift) & 0xff) * scale) >> 8, // white
             };
             uint8_t array_size = 3; // Assume 3 color LEDs, RGB
 
@@ -1099,52 +662,30 @@ ws2811_return_t  ws2811_render(ws2811_t *ws2811)
             {
                 for (k = 7; k >= 0; k--)                   // Bit
                 {
-                    // Inversion is handled by hardware for PWM, otherwise by software here
                     uint8_t symbol = SYMBOL_LOW;
-                    if ((driver_mode != PWM) && channel->invert) symbol = SYMBOL_LOW_INV;
 
                     if (color[j] & (1 << k))
                     {
                         symbol = SYMBOL_HIGH;
-                        if ((driver_mode != PWM) && channel->invert) symbol = SYMBOL_HIGH_INV;
                     }
 
                     for (l = 2; l >= 0; l--)               // Symbol
                     {
-                        uint32_t *wordptr = &((uint32_t *)pxl_raw)[wordpos];   // PWM & PCM
-                        volatile uint8_t  *byteptr = &pxl_raw[bytepos];    // SPI
+                        uint32_t *wordptr = &((uint32_t *)pwm_raw)[wordpos];
 
-                        if (driver_mode == SPI)
+                        *wordptr &= ~(1 << bitpos);
+                        if (symbol & (1 << l))
                         {
-                            *byteptr &= ~(1 << bitpos);
-                            if (symbol & (1 << l))
-                            {
-                                *byteptr |= (1 << bitpos);
-                            }
-			}
-			else  // PWM & PCM
-			{
-                            *wordptr &= ~(1 << bitpos);
-                            if (symbol & (1 << l))
-                            {
-                                *wordptr |= (1 << bitpos);
-                            }
+                            *wordptr |= (1 << bitpos);
                         }
 
                         bitpos--;
                         if (bitpos < 0)
                         {
-                            if (driver_mode == SPI)
-                            {
-                                bytepos++;
-                                bitpos = 7;
-                            }
-                            else  // PWM & PCM
-                            {
-                                // Every other word is on the same channel for PWM
-                                wordpos += (driver_mode == PWM ? 2 : 1);
-                                bitpos = 31;
-                            }
+                            // Every other word is on the same channel
+                            wordpos += 2;
+
+                            bitpos = 31;
                         }
                     }
                 }
@@ -1153,32 +694,13 @@ ws2811_return_t  ws2811_render(ws2811_t *ws2811)
     }
 
     // Wait for any previous DMA operation to complete.
-    if ((ret = ws2811_wait(ws2811)) != WS2811_SUCCESS)
+    if (ws2811_wait(ws2811))
     {
-        return ret;
+        return -1;
     }
 
-    if (driver_mode != SPI)
-    {
-        dma_start(ws2811);
-    }
-    else if ((ret = spi_transfer(ws2811)) != WS2811_SUCCESS)
-    {
-        return ret;
-    }
+    dma_start(ws2811);
 
-    return ret;
+    return 0;
 }
 
-const char * ws2811_get_return_t_str(const ws2811_return_t state)
-{
-    const int index = -state;
-    static const char * const ret_state_str[] = { WS2811_RETURN_STATES(WS2811_RETURN_STATES_STRING) };
-
-    if (index < sizeof(ret_state_str) / sizeof(ret_state_str[0]))
-    {
-        return ret_state_str[index];
-    }
-
-    return "";
-}
